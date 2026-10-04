@@ -1,0 +1,20 @@
+accelerate
+datasets>=2.14.6
+loguru
+peft>=0.19.1
+torch>=2.5
+sentencepiece
+scikit-learn
+tensorboard
+tqdm>=4.47.0
+transformers==5.17.0
+# AR3PO overrides private GRPOTrainer methods and mixes in an experimental
+# replay-buffer trainer.  Their contracts are version-specific; do not float.
+trl==0.29.1
+# GRPO's default launch configuration uses TRL's colocated vLLM backend.
+# vLLM is only installed on the intended Linux/CUDA training host; macOS can
+# still install the CPU-test dependencies and run with --use_vllm False.
+vllm>=0.10.2,<0.13.0; platform_system == "Linux"
+# bitsandbytes # not available on pypi
+latex2sympy2_extended
+math-verify==0.5.2
