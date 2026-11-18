@@ -16,7 +16,7 @@ set -euo pipefail
 #   aime2024       高难度        → 题量少(30)，k 要大
 #   agieval_gaokao 中文高考选择题 → 走独立的 MCQ 字母集合判分
 
-MODEL_PATH="${1:-outputs-dpo-qwen3-8b-math-merged}"
+MODEL_PATH="${1:-outputs-sft-qwen3-8b-math-merged}"
 K="${2:-8}"
 
 if [[ ( "$MODEL_PATH" == /* || "$MODEL_PATH" == ./* || "$MODEL_PATH" == outputs-* ) \
@@ -36,21 +36,34 @@ run_one () {  # data_file  max_new_tokens  batch
     name="$(basename "$data" .jsonl)"
     echo ""
     echo "==================== $name ===================="
-    python3 tools/evaluate_math.py \
+
+    rc=0
+    python tools/evaluate_math.py \
         --model "$MODEL_PATH" \
         --data "$data" \
         --num_samples "$K" \
         --batch_size "$bs" \
         --max_new_tokens "$mnt" \
-        --output "$OUT_DIR/$name.jsonl" || true   # 截断严重时脚本返回 2，不要让 set -e 中断后续
+        --temperature 0.6 \
+        --top_p 0.95 \
+        --top_k 20 \
+        --enable_thinking true \
+        --output "$OUT_DIR/$name.jsonl" || rc=$?
+
+    if [[ "$rc" -eq 2 ]]; then
+        echo "警告：$name 截断比例超过30%，本次准确率可能被低估。" >&2
+    elif [[ "$rc" -ne 0 ]]; then
+        echo "错误：$name 评测失败，退出码=$rc" >&2
+        return "$rc"
+    fi
 }
 
 #                       数据文件                          max_new  batch
-run_one data/eval/dapo_holdout.jsonl                       2048     8
-run_one data/eval/math500.jsonl                            2048     8
-run_one data/eval/agieval_gaokao.jsonl                     2048     8
+run_one data/eval/dapo_holdout.jsonl                       2048     4
+run_one data/eval/math500.jsonl                            2048     4
+run_one data/eval/agieval_gaokao.jsonl                     2048     4
 # AIME 只有 30 题，用更大的 k 和更长的输出；batch 调小防显存峰值
-run_one data/eval/aime2024.jsonl                           4096     4
+run_one data/eval/aime2024.jsonl                           4096     2
 
 echo ""
 echo "全部完成。明细在 $OUT_DIR/"

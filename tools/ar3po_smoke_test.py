@@ -8,10 +8,13 @@
   5. advantage 仍在完整的 G 条上计算（补齐样本参与组内归一化）
 """
 import sys
+from pathlib import Path
 
 import torch
 
-sys.path.insert(0, "/Users/liu/Downloads/MedicalGPT-main")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from datasets import Dataset  # noqa: E402
 from tokenizers import Tokenizer, models, pre_tokenizers, trainers  # noqa: E402

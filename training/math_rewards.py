@@ -31,11 +31,11 @@
         把 gold 包进 \\boxed{} → **100.0%**
     → 本模块统一对 gold 包 boxed。
 
-【坑 2】TRL 用 skip_special_tokens=True 解码，thinking 标记会被剥掉
-    Qwen3 的 ` thinking` / `response` 是 special token，解码后**不会出现在文本里**。
-    所以 format_reward **不能靠正则检查  thinking 标签**。
-    正确做法：用 completion_ids 里是否含 think-end token id 来判断
-    （通过 make_format_reward(think_end_token_id=...) 注入）。
+【坑 2】thinking 标记不能只靠解码文本判断
+    不同 tokenizer / 解码配置可能保留或剥掉 Qwen3 的 ``<think>`` / ``</think>``。
+    所以 format_reward 使用 completion token ids 检查首尾标记是否完整、有序，
+    而不是依赖可能变化的解码文本
+    （通过 make_format_reward 注入 ``<think>`` / ``</think>`` token id）。
 
 【坑 3】选择题（MCQ）不能用 math_verify 判分
     AGIEval 高考这类数据集的答案是「选项下标」（0-based，如 "[0 1 3]"），
@@ -233,7 +233,7 @@ mcq_accuracy_reward = make_mcq_reward()
 FMT_WEIGHTS = {
     "answer_marked": 0.5,      # 有最终答案标记（最重要）
     "has_structure": 0.3,      # 有可见推理结构
-    "thinking_used": 0.1,      # 走了思考流程（需注入 think_end_token_id 才生效）
+    "thinking_used": 0.1,      # 完整且有序的 <think>...</think>（需注入首尾 token id）
     "no_filler": 0.1,          # 无冗余套话
 }
 
@@ -241,13 +241,79 @@ FMT_WEIGHTS = {
 _MIN_NEWLINES = 3
 
 
-def make_format_reward(think_end_token_id: Optional[int] = None) -> Callable:
+def _latex_braces_balanced(text: str) -> bool:
+    """Return whether unescaped LaTeX braces are balanced and properly nested."""
+    depth = 0
+    for pos, char in enumerate(text):
+        if char not in "{}":
+            continue
+        preceding_slashes = 0
+        cursor = pos - 1
+        while cursor >= 0 and text[cursor] == "\\":
+            preceding_slashes += 1
+            cursor -= 1
+        if preceding_slashes % 2:
+            continue
+        if char == "{":
+            depth += 1
+        else:
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _has_complete_final_boxed(text: str) -> bool:
+    """Require the final ``\\boxed{...}``/``\\fbox{...}`` to close completely."""
+    starts = list(re.finditer(r"\\(?:boxed|fbox)\s*\{", text))
+    if not starts or not _latex_braces_balanced(text):
+        return False
+
+    start = starts[-1].end() - 1
+    depth = 0
+    for pos in range(start, len(text)):
+        if pos > 0 and text[pos - 1] == "\\":
+            continue
+        if text[pos] == "{":
+            depth += 1
+        elif text[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return True
+            if depth < 0:
+                return False
+    return False
+
+
+def _has_complete_thinking(
+    token_ids, think_start_token_id: int, think_end_token_id: int
+) -> bool:
+    """Only accept exactly one ordered, non-nested ``<think>...</think>`` pair."""
+    state = 0  # 0: before <think>, 1: inside, 2: closed
+    for token_id in token_ids:
+        if token_id == think_start_token_id:
+            if state != 0:
+                return False
+            state = 1
+        elif token_id == think_end_token_id:
+            if state != 1:
+                return False
+            state = 2
+    return state == 2
+
+
+def make_format_reward(
+    think_end_token_id: Optional[int] = None,
+    think_start_token_id: Optional[int] = None,
+) -> Callable:
     """构造规范性子分函数。
 
     Args:
-        think_end_token_id: Qwen3 的 `response` token id。传了就额外奖励「走了思考流程」。
-            **必须用 token id 判断**，因为 TRL 用 skip_special_tokens=True 解码，
-            文本里根本不会出现 thinking 标记。
+        think_end_token_id: Qwen3 的 ``</think>`` token id。
+        think_start_token_id: Qwen3 的 ``<think>`` token id。
+            两者都有效且 completion 中恰好存在一组成对、有序、非嵌套标签时，
+            才奖励「走了完整思考流程」。只传结束 token 不会获得奖励，防止孤立
+            ``</think>`` 刷分。必须使用 token id，因为解码配置可能剥离标记。
 
     返回 0 ~ 1 的连续值。为什么分档而不是二值：
         二值 format reward 在模型学会格式后恒为 1 → 退化成常数，不再提供梯度；
@@ -260,19 +326,28 @@ def make_format_reward(think_end_token_id: Optional[int] = None) -> Callable:
             text = completion[0]["content"] if isinstance(completion, list) else str(completion)
             score = 0.0
 
-            marked = ("\\boxed" in text or "####" in text
+            braces_ok = _latex_braces_balanced(text)
+            boxed_ok = _has_complete_final_boxed(text)
+            marked = (boxed_ok or "####" in text
                       or re.search(r"(?:答案|答)\s*[:：]", text) is not None)
-            structured = text.count("\n") >= _MIN_NEWLINES
+            # Malformed LaTeX (including an extra right brace) is not valid structure.
+            structured = braces_ok and text.count("\n") >= _MIN_NEWLINES
 
             if marked:
                 score += FMT_WEIGHTS["answer_marked"]
             if structured:
                 score += FMT_WEIGHTS["has_structure"]
 
-            # 思考流程：靠 token id 判断，不靠文本（见 docstring）
-            if think_end_token_id is not None and completion_ids is not None:
+            # 思考流程：必须是 completion 内完整成对的 token，孤立闭合标签不给分。
+            if (
+                think_start_token_id is not None
+                and think_end_token_id is not None
+                and completion_ids is not None
+            ):
                 ids = completion_ids[idx]
-                if hasattr(ids, "__len__") and think_end_token_id in list(ids):
+                if hasattr(ids, "__len__") and _has_complete_thinking(
+                    ids, think_start_token_id, think_end_token_id
+                ):
                     score += FMT_WEIGHTS["thinking_used"]
 
             # 冗余套话：只在「有实际内容」时才给干净分，
@@ -306,6 +381,8 @@ def _overlong_penalty(length: int, max_len: int, cache_len: int) -> float:
     if length <= max_len - cache_len:
         return 0.0
     if length <= max_len:
+        # The sign is intentionally negative and reaches -1 exactly at max_len:
+        # a completion that consumes the full budget is treated as truncated.
         return (max_len - cache_len - length) / cache_len
     return -1.0
 
@@ -318,6 +395,26 @@ def make_length_reward(max_len: int, cache_len: int) -> Callable:
         cache_len: 惩罚区间宽度，论文常用 max_len 的 1/4 左右
     """
 
+    def repetition_penalty(text: str) -> float:
+        """Conservatively penalize obvious loops without hurting concise answers."""
+        # Inspect the whole completion: loops inside the thinking section must
+        # not disappear merely because answer extraction strips that section.
+        body = text
+        chunks = [x.strip() for x in re.split(r"[\n.!?。！？]+", body) if len(x.strip()) >= 12]
+        if len(chunks) >= 4:
+            repeats = len(chunks) - len(set(chunks))
+            if repeats >= 2:
+                return -min(1.0, repeats / len(chunks))
+
+        # Catch repeated formulas/token runs even when the model emits no sentences.
+        words = re.findall(r"\\[A-Za-z]+|\w+|[^\s\w]", body)
+        if len(words) >= 48:
+            ngrams = [tuple(words[i:i + 8]) for i in range(len(words) - 7)]
+            duplicate_ratio = 1.0 - len(set(ngrams)) / len(ngrams)
+            if duplicate_ratio >= 0.35:
+                return -min(1.0, duplicate_ratio)
+        return 0.0
+
     def length_reward(completions, completion_ids=None, **kwargs) -> List[float]:
         if completion_ids is not None and len(completion_ids) > 0:
             lengths = [len(ids) for ids in completion_ids]
@@ -325,7 +422,13 @@ def make_length_reward(max_len: int, cache_len: int) -> Callable:
             lengths = [
                 len(c[0]["content"] if isinstance(c, list) else str(c)) for c in completions
             ]
-        return [_overlong_penalty(n, max_len, cache_len) for n in lengths]
+        texts = [c[0]["content"] if isinstance(c, list) else str(c) for c in completions]
+        # Both signals are non-positive; taking the stronger one preserves the
+        # existing 0..-1 scale while preventing repetitive reward hacking.
+        return [
+            min(_overlong_penalty(n, max_len, cache_len), repetition_penalty(text))
+            for n, text in zip(lengths, texts)
+        ]
 
     length_reward.__name__ = "length_reward"
     return length_reward
@@ -340,6 +443,7 @@ def build_reward_funcs(
     length_weight: float = 1.0,
     length_cache_ratio: float = 0.25,
     think_end_token_id: Optional[int] = None,
+    think_start_token_id: Optional[int] = None,
 ) -> tuple:
     """构造奖励函数列表与对应权重。
 
@@ -350,13 +454,16 @@ def build_reward_funcs(
     cache_len = max(1, int(max_completion_length * length_cache_ratio))
     funcs = [
         accuracy_reward,                                              # index 0 ← AR3PO 依赖
-        make_format_reward(think_end_token_id),                       # index 1
+        make_format_reward(                                          # index 1
+            think_end_token_id=think_end_token_id,
+            think_start_token_id=think_start_token_id,
+        ),
         make_length_reward(max_completion_length, cache_len),         # index 2
     ]
     weights = [1.0, format_weight, length_weight]
     logger.info(
         f"[rewards] accuracy(×1.0) + format(×{format_weight}) + "
         f"length(×{length_weight}, L_max={max_completion_length}, L_cache={cache_len}, "
-        f"think_end_id={think_end_token_id})"
+        f"think_start_id={think_start_token_id}, think_end_id={think_end_token_id})"
     )
     return funcs, weights

@@ -65,6 +65,10 @@ class ScriptArguments:
         default=1.0,
         metadata={"help": "DAPO 软长度惩罚的权重（函数本身返回 0 ~ -1）。"}
     )
+    enable_thinking: bool = field(
+        default=True,
+        metadata={"help": "显式传给 Qwen3 apply_chat_template 的 enable_thinking。"},
+    )
     # QLoRA arguments
     qlora: bool = field(default=False, metadata={"help": "Whether to use qlora"})
 
@@ -126,6 +130,13 @@ def grpo_train(
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    # TRL routes this dictionary to every rollout apply_chat_template call.
+    training_args.chat_template_kwargs = {
+        **(getattr(training_args, "chat_template_kwargs", None) or {}),
+        "enable_thinking": script_args.enable_thinking,
+    }
+    logger.info(f"enable_thinking={script_args.enable_thinking}")
 
     # Load datasets
     if script_args.train_file_dir and os.path.exists(script_args.train_file_dir):
@@ -354,17 +365,34 @@ def grpo_train(
         model.config.use_cache = True
         logger.info("Gradient checkpointing disabled.")
 
-    # 取 Qwen3 的 thinking 结束 token id。
-    # 必须用 token id 而不是正则：TRL 用 skip_special_tokens=True 解码，
-    # ` thinking` / `response` 是 special token，文本里根本不会出现。
+    # 只有 thinking 模式开启且首尾 token 都有效时才启用 thinking 奖励。
+    # 必须用 token id 而不是解码文本，避免 skip_special_tokens 配置差异。
+    think_start_token_id = None
     think_end_token_id = None
-    try:
-        tid = tokenizer.convert_tokens_to_ids(" response")
-        if isinstance(tid, int) and tid >= 0 and tid != tokenizer.unk_token_id:
-            think_end_token_id = tid
-            logger.info(f"检测到 Qwen3 thinking 结束 token: `response` → id={tid}")
-    except Exception as e:
-        logger.debug(f"未检测到 thinking token（非 Qwen3 模型可忽略）: {e}")
+    if script_args.enable_thinking:
+        try:
+            start_id = tokenizer.convert_tokens_to_ids("<think>")
+            end_id = tokenizer.convert_tokens_to_ids("</think>")
+            valid_start = (
+                isinstance(start_id, int) and not isinstance(start_id, bool) and start_id >= 0
+                and start_id != tokenizer.unk_token_id
+            )
+            valid_end = (
+                isinstance(end_id, int) and not isinstance(end_id, bool) and end_id >= 0
+                and end_id != tokenizer.unk_token_id
+            )
+            if valid_start and valid_end and start_id != end_id:
+                think_start_token_id = start_id
+                think_end_token_id = end_id
+                logger.info(
+                    f"检测到 Qwen3 thinking token: `<think>`={start_id}, `</think>`={end_id}"
+                )
+            else:
+                logger.warning("thinking token 不完整，已关闭 thinking 格式奖励。")
+        except Exception as e:
+            logger.debug(f"未检测到 thinking token（非 Qwen3 模型可忽略）: {e}")
+    else:
+        logger.info("enable_thinking=False：已关闭 thinking 格式奖励。")
 
     # 构造奖励函数：整体给分(accuracy) + 分层规范分(format) + DAPO 软长度惩罚(length)
     # 顺序很重要：accuracy 必须在 index 0，AR3POTrainer 靠它判定「全错」的难题。
@@ -373,6 +401,7 @@ def grpo_train(
         format_weight=getattr(script_args, "format_weight", 0.3),
         length_weight=getattr(script_args, "length_weight", 1.0),
         think_end_token_id=think_end_token_id,
+        think_start_token_id=think_start_token_id,
     )
     # TRL 0.29.x reads reward weights exclusively from GRPOConfig.  Passing
     # ``reward_weights`` to GRPOTrainer.__init__ raises ``TypeError`` because

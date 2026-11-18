@@ -24,8 +24,7 @@
 
 说明：
   · avg@k 的口径是「同一道题采样 k 次，命中率取平均，再对题目取平均」
-  · k>1 时采样是随机的（temperature 默认 1.0，Qwen 官方推荐值）；
-    k=1 时默认贪心，可用 --temperature 覆盖
+  · num_samples 只控制每题回答数；temperature 默认 0（贪心），两者互不改写
   · 会额外报告截断比例——截断率高说明 max_new_tokens 不够，
     准确率会被系统性低估，此时应先调大它再比较
 """
@@ -55,11 +54,12 @@ def parse_args():
     p.add_argument("--num_samples", type=int, default=1, help="每题采样次数 k（avg@k）")
     p.add_argument("--batch_size", type=int, default=4, help="每次前向的题目数")
     p.add_argument("--max_new_tokens", type=int, default=2048)
-    p.add_argument("--temperature", type=float, default=None,
-                   help="默认：k>1 时 1.0，k=1 时 0.0（贪心）")
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="采样温度；0 为贪心，>0 启用采样（默认 0）")
     p.add_argument("--top_p", type=float, default=0.95)
-    p.add_argument("--enable_thinking", default=None,
-                   help="传给 chat template；Qwen3 传 false 可关闭思考模式")
+    p.add_argument("--top_k", type=int, default=0)
+    p.add_argument("--enable_thinking", type=str.lower, choices=("true", "false"), default="true",
+                   help="显式传给 chat template（默认 true）")
     p.add_argument("--output", type=Path, help="把每题明细写成 jsonl")
     return p.parse_args()
 
@@ -67,9 +67,18 @@ def parse_args():
 def main():
     args = parse_args()
     temperature = args.temperature
-    if temperature is None:
-        temperature = 1.0 if args.num_samples > 1 else 0.0
+    if temperature < 0:
+        raise ValueError("--temperature 必须大于等于 0")
+    if args.num_samples < 1:
+        raise ValueError("--num_samples 必须大于等于 1")
+    if not 0.0 <= args.top_p <= 1.0:
+        raise ValueError("--top_p 必须在 [0, 1] 范围内")
+    if args.top_k < 0:
+        raise ValueError("--top_k 必须大于等于 0")
     do_sample = temperature > 0
+    enable_thinking = args.enable_thinking == "true"
+    if not do_sample and args.num_samples > 1:
+        print("提示：temperature=0 使用贪心解码，num_samples>1 的多个回答可能相同。")
 
     rows = [json.loads(line) for line in args.data.open(encoding="utf-8") if line.strip()]
     if args.limit > 0:
@@ -78,9 +87,7 @@ def main():
         raise ValueError(f"评测集为空: {args.data}")
 
     print(f"model={args.model}")
-    print(f"data={args.data}  n={len(rows)}  avg@{args.num_samples}  "
-          f"batch={args.batch_size}  temperature={temperature}  "
-          f"max_new_tokens={args.max_new_tokens}")
+    print(f"enable_thinking={enable_thinking}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
@@ -93,20 +100,56 @@ def main():
     ).eval()
     device = model.get_input_embeddings().weight.device
 
-    format_reward = make_format_reward()
 
-    # 取 Qwen3 的 thinking 结束 token（用于判断思考块是否完整）
+    # 只有 thinking 模式开启且首尾 token 都有效时才评估完整思考块。
+    think_start_token_id = None
     think_end_token_id = None
-    try:
-        tid = tokenizer.convert_tokens_to_ids(" response")
-        if isinstance(tid, int) and tid >= 0 and tid != tokenizer.unk_token_id:
-            think_end_token_id = tid
-    except Exception:
-        pass
+    if enable_thinking:
+        try:
+            start_id = tokenizer.convert_tokens_to_ids("<think>")
+            end_id = tokenizer.convert_tokens_to_ids("</think>")
+            valid_start = (
+                isinstance(start_id, int) and not isinstance(start_id, bool) and start_id >= 0
+                and start_id != tokenizer.unk_token_id
+            )
+            valid_end = (
+                isinstance(end_id, int) and not isinstance(end_id, bool) and end_id >= 0
+                and end_id != tokenizer.unk_token_id
+            )
+            if valid_start and valid_end and start_id != end_id:
+                think_start_token_id = start_id
+                think_end_token_id = end_id
+        except Exception:
+            pass
+    format_reward = make_format_reward(
+        think_end_token_id=think_end_token_id,
+        think_start_token_id=think_start_token_id,
+    )
+    template_kwargs = {"enable_thinking": enable_thinking}
 
-    template_kwargs = {}
-    if args.enable_thinking is not None:
-        template_kwargs["enable_thinking"] = str(args.enable_thinking).lower() != "false"
+    def add_eos_ids(value, target):
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        for token_id in values:
+            if isinstance(token_id, int) and not isinstance(token_id, bool) and token_id >= 0:
+                target.add(token_id)
+
+    eos_token_ids = set()
+    add_eos_ids(tokenizer.eos_token_id, eos_token_ids)
+    add_eos_ids(getattr(model.generation_config, "eos_token_id", None), eos_token_ids)
+    effective_eos_token_ids = sorted(eos_token_ids)
+
+    generation_config = {
+        "do_sample": do_sample,
+        "temperature": temperature,
+        "top_p": args.top_p if do_sample else None,
+        "top_k": args.top_k if do_sample else None,
+        "num_samples": args.num_samples,
+        "num_return_sequences": args.num_samples if do_sample else 1,
+        "max_new_tokens": args.max_new_tokens,
+        "eos_token_id": effective_eos_token_ids,
+        "pad_token_id": tokenizer.pad_token_id,
+    }
+    print("generation_config=" + json.dumps(generation_config, ensure_ascii=False, sort_keys=True))
 
     records = []
     done = 0
@@ -127,19 +170,26 @@ def main():
             "pad_token_id": tokenizer.pad_token_id,
             "do_sample": do_sample,
         }
+        # Use the same merged EOS set for generation and truncation accounting.
+        # The pad id remains padding-only unless it is independently a real EOS.
+        if effective_eos_token_ids:
+            gen_kwargs["eos_token_id"] = effective_eos_token_ids
         if do_sample:
-            gen_kwargs.update(temperature=temperature, top_p=args.top_p)
+            gen_kwargs.update(temperature=temperature, top_p=args.top_p, top_k=args.top_k)
         # 每题采样 k 条；HF 的输出顺序是「第0题的全部k条, 第1题的全部k条, ...」
-        if args.num_samples > 1:
+        if do_sample and args.num_samples > 1:
             gen_kwargs["num_return_sequences"] = args.num_samples
 
         with torch.inference_mode():
             output = model.generate(**inputs, **gen_kwargs)
 
         generated = output[:, prompt_len:]
+        if not do_sample and args.num_samples > 1:
+            # HF greedy decoding rejects num_return_sequences>1. Repeat the one
+            # deterministic completion so num_samples remains an output-count knob.
+            generated = generated.repeat_interleave(args.num_samples, dim=0)
         texts_out = tokenizer.batch_decode(generated, skip_special_tokens=True)
 
-        eos_and_pad = {tokenizer.eos_token_id, tokenizer.pad_token_id}
         k = args.num_samples
 
         for i, row in enumerate(batch):
@@ -159,15 +209,34 @@ def main():
             else:
                 accs = accuracy_reward(convs, [gold] * len(convs))
                 preds = [None] * len(convs)
+            raw_id_lists = [ids.tolist() if hasattr(ids, "tolist") else list(ids) for ids in ids_list]
+            sample_truncated = []
+            completion_tokens = []
+            completion_id_lists = []
+            for ids in raw_id_lists:
+                eos_positions = [j for j, token_id in enumerate(ids) if token_id in eos_token_ids]
+                if eos_positions:
+                    effective_ids = ids[:eos_positions[0] + 1]
+                    completion_id_lists.append(effective_ids)
+                    completion_tokens.append(len(effective_ids))
+                    sample_truncated.append(False)
+                    continue
+                effective_len = len(ids)
+                # A distinct pad token is padding only, never a successful EOS.
+                if tokenizer.pad_token_id not in eos_token_ids:
+                    while effective_len and ids[effective_len - 1] == tokenizer.pad_token_id:
+                        effective_len -= 1
+                completion_id_lists.append(ids[:effective_len])
+                completion_tokens.append(effective_len)
+                sample_truncated.append(effective_len >= args.max_new_tokens)
 
-            fmts = format_reward(convs, completion_ids=None)
+            fmts = format_reward(convs, completion_ids=completion_id_lists)
 
-            # 截断：最后 token 既不是 eos 也不是 pad
-            n_trunc = sum(
-                1 for ids in ids_list
-                if len(ids) > 0 and int(ids[-1]) not in eos_and_pad
-            )
+            sample_correct = [a == 1.0 for a in accs]
+            strict_correct = [ok and not truncated for ok, truncated in zip(sample_correct, sample_truncated)]
+            n_trunc = sum(sample_truncated)
             hit = sum(1 for a in accs if a == 1.0)
+            strict_hit = sum(strict_correct)
 
             records.append({
                 "question": row["question"],
@@ -178,8 +247,15 @@ def main():
                 "n_samples": len(completions),
                 "n_correct": hit,
                 "avg_at_k": hit / len(completions),
+                "raw_avg_at_k": hit / len(completions),
+                "strict_avg_at_k": strict_hit / len(completions),
+                "raw_pass_at_k": hit > 0,
+                "strict_pass_at_k": strict_hit > 0,
                 "mean_format": sum(fmts) / len(fmts),
                 "n_truncated": n_trunc,
+                "sample_correct": sample_correct,
+                "sample_truncated": sample_truncated,
+                "completion_tokens": completion_tokens,
                 "pred_letters": preds if is_mcq else None,   # 诊断：预测到了哪些字母
                 "completions": completions,
             })
@@ -191,19 +267,22 @@ def main():
 
     # ---------------- 汇总 ----------------
     n = len(records)
-    accuracy = sum(r["avg_at_k"] for r in records) / n
+    raw_avg_at_k = sum(r["raw_avg_at_k"] for r in records) / n
+    strict_avg_at_k = sum(r["strict_avg_at_k"] for r in records) / n
     mean_format = sum(r["mean_format"] for r in records) / n
     trunc_ratio = sum(r["n_truncated"] for r in records) / sum(r["n_samples"] for r in records)
     # 单次贪心时也报「命中率」，等价于 pass@k 的上界口径
-    any_correct = sum(1 for r in records if r["n_correct"] > 0) / n
+    raw_pass_at_k = sum(r["raw_pass_at_k"] for r in records) / n
+    strict_pass_at_k = sum(r["strict_pass_at_k"] for r in records) / n
 
     print("\n" + "=" * 62)
     print(f"model            = {args.model}")
     print(f"data             = {args.data}")
     print(f"n (题目数)        = {n}")
-    print(f"avg@{args.num_samples} (主指标)   = {accuracy:.2%}")
-    if args.num_samples > 1:
-        print(f"pass@{args.num_samples} (至少对1条) = {any_correct:.2%}")
+    print(f"raw_avg_at_k      (k={args.num_samples}) = {raw_avg_at_k:.2%}")
+    print(f"strict_avg_at_k   (k={args.num_samples}) = {strict_avg_at_k:.2%}")
+    print(f"raw_pass_at_k     (k={args.num_samples}) = {raw_pass_at_k:.2%}")
+    print(f"strict_pass_at_k  (k={args.num_samples}) = {strict_pass_at_k:.2%}")
     print(f"mean_format      = {mean_format:.4f}")
     print(f"截断比例          = {trunc_ratio:.2%}"
           + ("   ⚠️ 偏高，准确率被系统性低估，请调大 --max_new_tokens"

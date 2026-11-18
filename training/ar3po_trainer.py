@@ -83,6 +83,11 @@ from trl import GRPOConfig, GRPOTrainer
 class AR3POConfig(GRPOConfig):
     """在 GRPOConfig 之上增加 AR3PO 的开关。"""
 
+    mask_truncated_completions: bool = field(
+        default=True,
+        metadata={"help": "Mask completions that reach max_completion_length without EOS."},
+    )
+
     ar3po_stages: int = field(
         default=2,
         metadata={

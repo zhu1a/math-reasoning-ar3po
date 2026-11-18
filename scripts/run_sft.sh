@@ -12,10 +12,11 @@ set -euo pipefail
 # 注意：原脚本把注释写在 `\` 后续行里，会导致后续参数被 bash 当成注释吃掉，
 #       实际上一条参数都没传进去。已修正。
 # ============================================================================
+BASE_MODEL=/root/autodl-tmp/models/Qwen3-8B
 
 CUDA_VISIBLE_DEVICES=0 python3 training/supervised_finetuning.py \
-    --model_name_or_path Qwen/Qwen3-8B \
-    --train_file_dir ./data/sft \
+    --model_name_or_path "$BASE_MODEL"  \
+    --train_file_dir ./data/sft_thinking/math_sft_demo_thinking.jsonl \
     --validation_split_percentage 5 \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 1 \
@@ -38,7 +39,7 @@ CUDA_VISIBLE_DEVICES=0 python3 training/supervised_finetuning.py \
     --save_total_limit 3 \
     --gradient_accumulation_steps 4 \
     --preprocessing_num_workers 4 \
-    --output_dir outputs-sft-qwen3-8b-math \
+    --output_dir outputs-sft-qwen3-8b-math-thinking \
     --logging_first_step True \
     --target_modules all \
     --lora_rank 16 \
@@ -49,13 +50,15 @@ CUDA_VISIBLE_DEVICES=0 python3 training/supervised_finetuning.py \
     --report_to tensorboard \
     --gradient_checkpointing True \
     --tool_format default \
-    --cache_dir ./cache
+    --enable_thinking true \
+    --cache_dir ./cache \
+    --enable_thinking true \
 
 echo "合并 SFT LoRA adapter，供 GRPO 作为真正的起点..."
 python3 tools/merge_peft_adapter.py \
-    --base_model Qwen/Qwen3-8B \
-    --tokenizer_path Qwen/Qwen3-8B \
-    --lora_model outputs-sft-qwen3-8b-math \
-    --output_dir outputs-sft-qwen3-8b-math-merged
+    --base_model "$BASE_MODEL"  \
+    --tokenizer_path "$BASE_MODEL" \
+    --lora_model outputs-sft-qwen3-8b-math-thinking \
+    --output_dir outputs-sft-qwen3-8b-math-thinking-merged
 
 echo "SFT 完成并已合并! 下一步: bash scripts/run_grpo.sh"

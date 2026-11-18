@@ -214,6 +214,10 @@ class ScriptArguments:
         default=None,
         metadata={"help": "Tool format to use for agent training. Options: default, glm4, llama3, mistral, qwen."}
     )
+    enable_thinking: bool = field(
+        default=True,
+        metadata={"help": "显式传给 Qwen3 apply_chat_template 的 enable_thinking。"},
+    )
 
     def __post_init__(self):
         if self.model_max_length < 60:
@@ -415,15 +419,44 @@ def main():
             raw_datasets["validation"] = split["test"]
     else:
         # Loading a dataset from local files.
+        def resolve_jsonl_files(path_value, argument_name):
+            """Resolve either one JSONL file or a directory containing JSONL files."""
+            if not path_value:
+                return []
+            resolved = os.path.abspath(os.path.expanduser(path_value))
+            if os.path.isfile(resolved):
+                if not resolved.lower().endswith(".jsonl"):
+                    raise ValueError(
+                        f"{argument_name} 指向文件时必须是 .jsonl: {resolved}"
+                    )
+                files = [resolved]
+            elif os.path.isdir(resolved):
+                files = sorted(glob(os.path.join(resolved, "**", "*.jsonl"), recursive=True))
+            else:
+                raise FileNotFoundError(
+                    f"{argument_name} 路径不存在: {resolved}（当前工作目录: {os.getcwd()}）"
+                )
+            if not files:
+                raise FileNotFoundError(
+                    f"{argument_name} 未找到任何 .jsonl: {resolved}"
+                )
+            return files
+
         data_files = {}
-        if data_args.train_file_dir is not None and os.path.exists(data_args.train_file_dir):
-            train_data_files = glob(f'{data_args.train_file_dir}/**/*.jsonl', recursive=True)
+        if data_args.train_file_dir is not None:
+            train_data_files = resolve_jsonl_files(
+                data_args.train_file_dir, "--train_file_dir"
+            )
             logger.info(f"train files: {train_data_files}")
             data_files["train"] = train_data_files
-        if data_args.validation_file_dir is not None and os.path.exists(data_args.validation_file_dir):
-            eval_data_files = glob(f'{data_args.validation_file_dir}/**/*.jsonl', recursive=True)
+        if data_args.validation_file_dir is not None:
+            eval_data_files = resolve_jsonl_files(
+                data_args.validation_file_dir, "--validation_file_dir"
+            )
             logger.info(f"eval files: {eval_data_files}")
             data_files["validation"] = eval_data_files
+        if "train" not in data_files:
+            raise ValueError("本地 SFT 训练必须提供 --train_file_dir")
         raw_datasets = load_local_json_datasets(data_files, cache_dir=model_args.cache_dir)
         # If no validation data is there, validation_split_percentage will be used to divide the dataset.
         if "validation" not in raw_datasets.keys():
@@ -532,13 +565,15 @@ def main():
                     for uq, br in history_messages:
                         accumulated.append({"role": "user", "content": uq})
                         cur_text = tokenizer.apply_chat_template(
-                            accumulated, tokenize=False, add_generation_prompt=True
+                            accumulated, tokenize=False, add_generation_prompt=True,
+                            enable_thinking=script_args.enable_thinking,
                         )
                         convs.append(cur_text[len(prev_text):])
                         convs.append(br)
                         accumulated.append({"role": "assistant", "content": br})
                         prev_text = tokenizer.apply_chat_template(
-                            accumulated, tokenize=False, add_generation_prompt=False
+                            accumulated, tokenize=False, add_generation_prompt=False,
+                            enable_thinking=script_args.enable_thinking,
                         )
                     yield convs
 

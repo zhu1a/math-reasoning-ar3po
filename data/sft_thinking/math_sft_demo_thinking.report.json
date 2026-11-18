@@ -1,0 +1,18 @@
+{
+  "input": "/root/autodl-tmp/math-reasoning-ar3po/data/sft/math_sft_demo.jsonl",
+  "input_sha256": "757adc19f1bf2afbada4a89a09e8316aea0b28168fd298657550dac8256e2c41",
+  "output": "/root/autodl-tmp/math-reasoning-ar3po/data/sft_thinking/math_sft_demo_thinking.jsonl",
+  "tokenizer": "/root/autodl-tmp/models/Qwen3-8B",
+  "max_length": 2048,
+  "total_rows": 2000,
+  "accepted_rows": 1978,
+  "rejected_rows": 22,
+  "rejection_reasons": {
+    "invalid_boxed_answer": 15,
+    "missing_balanced_boxed_answer": 2,
+    "over_max_length": 2,
+    "suspicious_content": 4
+  },
+  "think_start_token_id": 151667,
+  "think_end_token_id": 151668
+}

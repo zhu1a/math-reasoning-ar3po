@@ -110,11 +110,14 @@ for desc, text, want in fmt_cases:
 
 # thinking 检测必须靠 token id，不能靠文本（TRL 会剥掉 special token）
 THINK_END = 151668
-fr = make_format_reward(think_end_token_id=THINK_END)
+THINK_START = 151667
+fr = make_format_reward(
+    think_end_token_id=THINK_END, think_start_token_id=THINK_START
+)
+got = fr(conv("\\boxed{42}"), completion_ids=[[11, THINK_START, 22, THINK_END, 33]])[0]
+check("thinking 检测（首尾完整）", got, 0.7)
 got = fr(conv("\\boxed{42}"), completion_ids=[[11, 22, THINK_END, 33]])[0]
-check("thinking 检测（含 think_end token）", got, 0.7)
-got = fr(conv("\\boxed{42}"), completion_ids=[[11, 22, 33]])[0]
-check("thinking 检测（不含）", got, 0.6)
+check("thinking 检测（孤立结束 token）", got, 0.6)
 
 scores = {make_format_reward()(conv(t))[0] for _, t, _ in fmt_cases}
 print(f"\n  format_reward 取值集合: {sorted(scores)} → 共 {len(scores)} 档")
